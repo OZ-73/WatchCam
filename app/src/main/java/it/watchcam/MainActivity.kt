@@ -17,6 +17,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
@@ -42,22 +43,26 @@ import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 /**
  * WatchCam: controlla foto e video del telefono dai comandi multimediali dell'orologio.
  *   Play / Pausa  -> scatta foto
- *   Avanti        -> avvia / ferma video
- *   Indietro      -> cambia fotocamera (anteriore/posteriore)
+ *   Avanti        -> AVVIA video (se sta già registrando non fa nulla)
+ *   Indietro      -> FERMA video (se non sta registrando non fa nulla)
+ * Il cambio camera resta solo sul pulsante a schermo.
  */
 class MainActivity : ComponentActivity() {
 
-    private enum class Cmd { PHOTO, VIDEO, FLIP }
+    private enum class Cmd { PHOTO, VIDEO_START, VIDEO_STOP }
 
     private lateinit var previewView: PreviewView
     private lateinit var status: TextView
+    private lateinit var blackOverlay: View
     private var imageCapture: ImageCapture? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var recording: Recording? = null
@@ -81,6 +86,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.decorView.setBackgroundColor(Color.BLACK)
         buildUi()
         setupMediaSession()
         permLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
@@ -92,17 +98,19 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.WHITE)
             textSize = 16f
             setPadding(24, 24, 24, 8)
-            text = "Pronto. Orologio: Play/Pausa = foto, Avanti = video, Indietro = gira"
+            text = "Pronto. Orologio: Play/Pausa = foto, Avanti = avvia video, Indietro = ferma video"
         }
         fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
             text = label
+            isAllCaps = false
             setOnClickListener { onClick() }
             layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
         }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Foto") { takePhoto() })
-            addView(btn("Video") { toggleVideo() })
+            addView(btn("Rec") { startVideo() })
+            addView(btn("Stop") { stopVideo() })
             addView(btn("Gira") { flipCamera() })
             addView(btn("Scuro") { toggleDim() })
         }
@@ -112,16 +120,26 @@ class MainActivity : ComponentActivity() {
             addView(status)
             addView(row)
         }
-        val root = FrameLayout(this).apply {
+        val content = FrameLayout(this).apply {
             addView(previewView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(bottom, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
         }
-        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+        // Schermata nera a pieno schermo: sull'OLED i pixel neri sono spenti. Tocca per riaccendere.
+        blackOverlay = View(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+            setOnClickListener { toggleDim() }
+        }
+        val outer = FrameLayout(this).apply {
+            addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(blackOverlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(outer) { _, insets ->
             val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(b.left, b.top, b.right, b.bottom)
+            content.setPadding(b.left, b.top, b.right, b.bottom)
             insets
         }
-        setContentView(root)
+        setContentView(outer)
     }
 
     // ---------- Camera ----------
@@ -176,13 +194,9 @@ class MainActivity : ComponentActivity() {
             })
     }
 
-    private fun toggleVideo() {
-        val current = recording
-        if (current != null) {
-            current.stop()
-            recording = null
-            return
-        }
+    /** Avvia la registrazione. Se è già in corso non fa nulla. */
+    private fun startVideo() {
+        if (recording != null) return
         val vc = videoCapture ?: return
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_${stamp()}")
@@ -204,7 +218,6 @@ class MainActivity : ComponentActivity() {
                 is VideoRecordEvent.Start -> setStatus("● REGISTRAZIONE IN CORSO")
                 is VideoRecordEvent.Finalize -> {
                     recording = null
-                    sound.play(MediaActionSound.STOP_VIDEO_RECORDING)
                     setStatus(
                         if (ev.hasError()) "Errore video (${ev.error})"
                         else "Video salvato in Film/WatchCam"
@@ -213,6 +226,14 @@ class MainActivity : ComponentActivity() {
                 else -> {}
             }
         }
+    }
+
+    /** Ferma la registrazione. Se non è in corso non fa nulla. */
+    private fun stopVideo() {
+        val current = recording ?: return
+        sound.play(MediaActionSound.STOP_VIDEO_RECORDING)
+        current.stop()
+        recording = null
     }
 
     private fun flipCamera() {
@@ -224,10 +245,16 @@ class MainActivity : ComponentActivity() {
 
     private fun toggleDim() {
         dimmed = !dimmed
+        blackOverlay.visibility = if (dimmed) View.VISIBLE else View.GONE
         val lp = window.attributes
         lp.screenBrightness =
             if (dimmed) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         window.attributes = lp
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (dimmed) controller.hide(WindowInsetsCompat.Type.systemBars())
+        else controller.show(WindowInsetsCompat.Type.systemBars())
     }
 
     private fun setStatus(msg: String) { status.text = msg }
@@ -241,8 +268,8 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             when (c) {
                 Cmd.PHOTO -> takePhoto()
-                Cmd.VIDEO -> toggleVideo()
-                Cmd.FLIP -> flipCamera()
+                Cmd.VIDEO_START -> startVideo()
+                Cmd.VIDEO_STOP -> stopVideo()
             }
             publishPlaying() // mantiene lo stato "in riproduzione" per i prossimi comandi
         }
@@ -261,21 +288,21 @@ class MainActivity : ComponentActivity() {
                         KeyEvent.KEYCODE_MEDIA_PAUSE,
                         KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                         KeyEvent.KEYCODE_HEADSETHOOK -> command(Cmd.PHOTO)
-                        KeyEvent.KEYCODE_MEDIA_NEXT -> command(Cmd.VIDEO)
-                        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> command(Cmd.FLIP)
+                        KeyEvent.KEYCODE_MEDIA_NEXT -> command(Cmd.VIDEO_START)
+                        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> command(Cmd.VIDEO_STOP)
                     }
                 }
                 return true
             }
             override fun onPlay() = command(Cmd.PHOTO)
             override fun onPause() = command(Cmd.PHOTO)
-            override fun onSkipToNext() = command(Cmd.VIDEO)
-            override fun onSkipToPrevious() = command(Cmd.FLIP)
+            override fun onSkipToNext() = command(Cmd.VIDEO_START)
+            override fun onSkipToPrevious() = command(Cmd.VIDEO_STOP)
         })
         s.setMetadata(
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, "WatchCam")
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Play=foto  Avanti=video")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Play=foto  Avanti=rec  Indietro=stop")
                 .build()
         )
         session = s
